@@ -56,13 +56,18 @@ def _read_recent(folder: Path, today: str) -> str:
 
 
 def _read_days(folder: Path, days: int = 7) -> str:
+    if not folder.exists():
+        logger.debug("_read_days: folder does not exist: %s", folder)
+        return ""
     cutoff = date.today() - timedelta(days=days)
     parts = []
     for f in sorted(folder.glob("*.md"), reverse=True):
         try:
             file_date = date.fromisoformat(f.stem)
         except ValueError:
+            logger.debug("_read_days: skipping non-date file %s", f.name)
             continue
+        logger.debug("_read_days: %s — date=%s cutoff=%s included=%s", f.name, file_date, cutoff, file_date >= cutoff)
         if file_date >= cutoff:
             parts.append(f.read_text(encoding="utf-8").strip())
     return "\n\n".join(parts)
@@ -271,7 +276,8 @@ def body_agent(text: str) -> str:
 def develop_agent(idea_name: str) -> str:
     """Generate Socratic questions for an idea and track its maturity."""
     idea_content = ""
-    for f in sorted((VAULT / "ideas").glob("*.md"), reverse=True):
+    ideas_folder = VAULT / "ideas"
+    for f in sorted(ideas_folder.glob("*.md"), reverse=True) if ideas_folder.exists() else []:
         content = f.read_text(encoding="utf-8")
         if idea_name.lower() in content.lower():
             idea_content = content[:800]
@@ -484,14 +490,48 @@ TASK_KEYWORDS    = {"todo", "task", "need to", "school", "work", "homework", "as
 SCHED_KEYWORDS   = {"schedule", "habit", "routine", "plan", "morning", "evening", "weekly"}
 IDEA_KEYWORDS    = {"idea", "future", "someday", "maybe", "concept", "what if", "could", "brainstorm"}
 JOURNAL_KEYWORDS = {"today was", "today i ", "i felt", "i feel", "feeling", "my day", "journal", "diary", "reflecting", "reflection", "mood"}
-FOCUS_PHRASES    = {"what should i focus", "what to focus", "focus today", "what should i do today",
-                    "priorities today", "what's on my plate", "what to work on", "daily focus", "what do i need to do"}
+
+FOCUS_PHRASES  = {"what should i focus", "what to focus", "focus today", "what should i do today",
+                   "priorities today", "what's on my plate", "what to work on", "daily focus", "what do i need to do"}
+LEARN_PHRASES  = {"i learned", "i just learned", "i want to remember", "want to remember",
+                   "note to self", "key insight", "important lesson", "remember that", "remember this"}
+READ_PHRASES   = {"i read", "i'm reading", "i finished reading", "just finished reading",
+                   "key takeaway", "the book says", "this article", "reading log"}
+DECIDE_PHRASES = {"i decided", "i've decided", "made a decision", "my decision is",
+                   "i'm choosing to", "going with", "i'm going to go with", "decision:"}
+BODY_PHRASES   = {"i slept", "slept for", "hours of sleep", "energy level", "energy is",
+                   "worked out", "hit the gym", "skipped the gym", "didn't work out", "no workout", "my workout"}
+RECALL_PHRASES = {"what did i", "remind me", "what have i saved", "search my",
+                   "look up", "find my notes", "what do i know about", "have i written about"}
+WEEK_PHRASES   = {"weekly review", "how was my week", "week in review", "weekly summary", "review my week"}
+
+
+def _natural_recall(text: str) -> str:
+    """Extract the search topic from a natural language recall request, then search."""
+    topic = _call_claude(
+        system="Extract the search topic from this query in 1-5 words. Output only the search terms, nothing else.",
+        user=text,
+        max_tokens=20,
+    ).strip()
+    return recall_agent(topic)
 
 
 def orchestrate(text: str) -> str:
     lower = text.lower()
     if any(kw in lower for kw in FOCUS_PHRASES):
         return focus_agent()
+    if any(kw in lower for kw in RECALL_PHRASES):
+        return _natural_recall(text)
+    if any(kw in lower for kw in WEEK_PHRASES):
+        return week_agent()
+    if any(kw in lower for kw in LEARN_PHRASES):
+        return learn_agent(text)
+    if any(kw in lower for kw in READ_PHRASES):
+        return read_agent(text)
+    if any(kw in lower for kw in DECIDE_PHRASES):
+        return decide_agent(text)
+    if any(kw in lower for kw in BODY_PHRASES):
+        return body_agent(text)
     if any(kw in lower for kw in FINANCE_KEYWORDS):
         return finance_agent(text)
     if any(kw in lower for kw in TASK_KEYWORDS):
@@ -593,11 +633,40 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Weekly review:\n\n{week_agent()}")
 
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _save_chat_id(update.message.chat_id)
+    lines = [f"Vault: {VAULT.resolve()}", f"Vault exists: {VAULT.exists()}", ""]
+    for folder in sorted(VAULT.iterdir()) if VAULT.exists() else []:
+        if folder.is_dir():
+            files = sorted(folder.glob("*"))
+            lines.append(f"{folder.name}/ ({len(files)} files)")
+            for f in files[-3:]:  # show last 3
+                lines.append(f"  {f.name}")
+        else:
+            lines.append(folder.name)
+    await update.message.reply_text("\n".join(lines) or "Vault is empty.")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.message:
+        await update.message.reply_text(f"Error: {type(context.error).__name__}: {context.error}")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Startup vault diagnostic
+    logger.info("Vault path: %s (exists=%s)", VAULT.resolve(), VAULT.exists())
+    if VAULT.exists():
+        for folder in sorted(VAULT.iterdir()):
+            if folder.is_dir():
+                files = list(folder.glob("*"))
+                logger.info("  %s/ — %d files: %s", folder.name, len(files),
+                            [f.name for f in sorted(files)[-5:]])
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -610,6 +679,9 @@ def main() -> None:
     app.add_handler(CommandHandler("body",    cmd_body))
     app.add_handler(CommandHandler("develop", cmd_develop))
     app.add_handler(CommandHandler("week",    cmd_week))
+    app.add_handler(CommandHandler("debug",   cmd_debug))
+
+    app.add_error_handler(error_handler)
 
     # Scheduled jobs — all times UTC, adjust hour for your timezone
     app.job_queue.run_daily(morning_briefing, time=dtime(6,  0, 0, tzinfo=timezone.utc))
