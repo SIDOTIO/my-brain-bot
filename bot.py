@@ -106,8 +106,17 @@ def _save_json(path: Path, data) -> None:
 # ---------------------------------------------------------------------------
 
 def transcribe(file_path: str) -> str:
+    size = os.path.getsize(file_path)
+    logger.info("Transcribing %s — file size: %d bytes", file_path, size)
+    if size == 0:
+        raise ValueError("Audio file is empty — download failed")
     with open(file_path, "rb") as f:
-        result = openai.audio.transcriptions.create(model="whisper-1", file=f)
+        # Pass as tuple so openai>=1.52 knows the format (ogg/opus from Telegram)
+        result = openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=("voice.ogg", f, "audio/ogg"),
+        )
+    logger.info("Whisper full result: %r", result.text)
     return result.text
 
 
@@ -788,6 +797,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(voice.file_id)
     tmp_path = f"/tmp/{voice.file_id}.ogg"
     await file.download_to_drive(tmp_path)
+    size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+    logger.info("Downloaded voice file: %s (%d bytes)", tmp_path, size)
     try:
         text = transcribe(tmp_path)
         logger.info("Transcribed: %s", text)
