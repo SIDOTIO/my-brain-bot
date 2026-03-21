@@ -110,12 +110,15 @@ def transcribe(file_path: str) -> str:
     logger.info("Transcribing %s — file size: %d bytes", file_path, size)
     if size == 0:
         raise ValueError("Audio file is empty — download failed")
+    # Read all bytes into memory first — passing a file handle to httpx (used
+    # by openai>=1.52) can stop reading mid-stream on some platforms
     with open(file_path, "rb") as f:
-        # Pass as tuple so openai>=1.52 knows the format (ogg/opus from Telegram)
-        result = openai.audio.transcriptions.create(
-            model="whisper-1",
-            file=("voice.ogg", f, "audio/ogg"),
-        )
+        audio_bytes = f.read()
+    logger.info("Read %d bytes into memory for Whisper", len(audio_bytes))
+    result = openai.audio.transcriptions.create(
+        model="whisper-1",
+        file=("voice.ogg", audio_bytes, "audio/ogg"),
+    )
     logger.info("Whisper full result: %r", result.text)
     return result.text
 
