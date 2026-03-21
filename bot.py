@@ -501,9 +501,11 @@ DECIDE_PHRASES = {"i decided", "i've decided", "made a decision", "my decision i
                    "i'm choosing to", "going with", "i'm going to go with", "decision:"}
 BODY_PHRASES   = {"i slept", "slept for", "hours of sleep", "energy level", "energy is",
                    "worked out", "hit the gym", "skipped the gym", "didn't work out", "no workout", "my workout"}
-RECALL_PHRASES = {"what did i", "remind me", "what have i saved", "search my",
-                   "look up", "find my notes", "what do i know about", "have i written about"}
-WEEK_PHRASES   = {"weekly review", "how was my week", "week in review", "weekly summary", "review my week"}
+RECALL_PHRASES  = {"what did i", "remind me", "what have i saved", "search my",
+                    "look up", "find my notes", "what do i know about", "have i written about"}
+WEEK_PHRASES    = {"weekly review", "how was my week", "week in review", "weekly summary", "review my week"}
+QUESTION_WORDS  = {"what ", "how much", "how many", "show me", "tell me", "did i ", "have i ",
+                    "how did", "how do", "when did", "where did", "which ", "who ", "why did"}
 
 
 def _natural_recall(text: str) -> str:
@@ -516,11 +518,19 @@ def _natural_recall(text: str) -> str:
     return recall_agent(topic)
 
 
+def _is_question(lower: str) -> bool:
+    if lower.rstrip().endswith("?"):
+        return True
+    return any(lower.startswith(qw) or f" {qw}" in lower for qw in QUESTION_WORDS)
+
+
 def orchestrate(text: str) -> str:
     lower = text.lower()
     if any(kw in lower for kw in FOCUS_PHRASES):
         return focus_agent()
     if any(kw in lower for kw in RECALL_PHRASES):
+        return _natural_recall(text)
+    if _is_question(lower):
         return _natural_recall(text)
     if any(kw in lower for kw in WEEK_PHRASES):
         return week_agent()
