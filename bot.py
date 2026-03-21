@@ -210,19 +210,50 @@ def learn_agent(text: str) -> str:
     return "Got it! Saved to knowledge. First review tomorrow."
 
 
+FOLDER_KEYWORDS = {
+    "expenses":    {"expense", "spent", "spending", "money", "cost", "bought", "paid", "bill", "purchase"},
+    "income":      {"income", "earned", "salary", "received", "revenue"},
+    "todos-work":  {"todo", "task", "work", "meeting", "deadline", "project"},
+    "todos-school":{"school", "homework", "class", "assignment", "study"},
+    "journal":     {"journal", "day", "entry", "wrote", "logged"},
+    "habits":      {"habit", "routine", "streak", "morning", "evening"},
+    "ideas":       {"idea", "concept", "brainstorm"},
+    "decisions":   {"decision", "decided", "chose", "choice"},
+    "body":        {"sleep", "slept", "energy", "workout", "gym", "body"},
+    "reading-log": {"read", "reading", "book", "article"},
+}
+
+
 def recall_agent(query: str) -> str:
     """Search vault files for a query and synthesize with Claude."""
-    folders = [
+    query_lower = query.lower()
+    matches = []
+
+    # Folder-keyword routing: if query implies a category, read that whole folder
+    targeted_folders = {
+        folder for folder, keywords in FOLDER_KEYWORDS.items()
+        if any(kw in query_lower for kw in keywords)
+    }
+
+    # Fall back to searching all folders by content if no folder matched
+    all_folders = [
         "journal", "ideas", "todos-work", "todos-school",
         "habits", "expenses", "income", "reading-log", "decisions", "body",
     ]
-    matches = []
-    query_lower = query.lower()
-    for folder in folders:
-        for f in (VAULT / folder).glob("*.md"):
-            content = f.read_text(encoding="utf-8")
-            if query_lower in content.lower():
-                matches.append(f"[{folder}/{f.name}]\n{content[:500]}")
+    search_folders = targeted_folders if targeted_folders else all_folders
+
+    for folder in search_folders:
+        folder_path = VAULT / folder
+        if not folder_path.exists():
+            continue
+        for f in sorted(folder_path.glob("*.md"), reverse=True)[:14]:  # last 2 weeks
+            content = f.read_text(encoding="utf-8").strip()
+            if content:
+                matches.append(f"[{folder}/{f.name}]\n{content[:600]}")
+
+    # For non-targeted searches, also filter by keyword match within content
+    if not targeted_folders:
+        matches = [m for m in matches if query_lower in m.lower()]
 
     # Search knowledge index too
     index_path = VAULT / "knowledge" / "index.json"
@@ -482,77 +513,263 @@ async def evening_checks(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator
+# AI Orchestrator — Claude Haiku decides everything
 # ---------------------------------------------------------------------------
 
-FINANCE_KEYWORDS = {"money", "expense", "spent", "earned", "income", "paid", "cost", "bought", "price", "bill", "salary"}
-TASK_KEYWORDS    = {"todo", "task", "need to", "school", "work", "homework", "assignment", "meeting", "deadline"}
-SCHED_KEYWORDS   = {"schedule", "habit", "routine", "plan", "morning", "evening", "weekly"}
-IDEA_KEYWORDS    = {"idea", "future", "someday", "maybe", "concept", "what if", "could", "brainstorm"}
-JOURNAL_KEYWORDS = {"today was", "today i ", "i felt", "i feel", "feeling", "my day", "journal", "diary", "reflecting", "reflection", "mood"}
+TOOLS = [
+    {
+        "name": "save_expense",
+        "description": "Save a financial expense or income entry",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "category": {"type": "string", "enum": ["expense", "income"]},
+            },
+            "required": ["text", "category"],
+        },
+    },
+    {
+        "name": "save_todo",
+        "description": "Save a task or to-do item",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "context": {"type": "string", "enum": ["work", "school"]},
+            },
+            "required": ["text", "context"],
+        },
+    },
+    {
+        "name": "save_journal",
+        "description": "Save a personal journal entry, feeling, reflection, or daily log",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "save_idea",
+        "description": "Save an idea, concept, or creative thought",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "save_habit",
+        "description": "Save a habit, routine, or schedule entry",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "save_knowledge",
+        "description": "Save something the user wants to learn and retain, with spaced repetition scheduling",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "save_decision",
+        "description": "Save a decision the user has made with their reasoning",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "save_body",
+        "description": "Save health and body data: sleep hours, energy level, workout",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "save_reading",
+        "description": "Save a reading note from a book or article",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "search_vault",
+        "description": "Search the user's saved notes to answer a question about past data",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to look for"},
+                "folders": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "journal", "ideas", "todos-work", "todos-school",
+                            "habits", "expenses", "income", "reading-log",
+                            "decisions", "body", "knowledge",
+                        ],
+                    },
+                    "description": "Folders to search — pick the relevant ones, or omit to search all",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_focus_list",
+        "description": "Get the user's current todos and priorities to build a focus plan for today",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_weekly_review",
+        "description": "Generate a weekly review of activities, habits, spending, and ideas",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+]
 
-FOCUS_PHRASES  = {"what should i focus", "what to focus", "focus today", "what should i do today",
-                   "priorities today", "what's on my plate", "what to work on", "daily focus", "what do i need to do"}
-LEARN_PHRASES  = {"i learned", "i just learned", "i want to remember", "want to remember",
-                   "note to self", "key insight", "important lesson", "remember that", "remember this"}
-READ_PHRASES   = {"i read", "i'm reading", "i finished reading", "just finished reading",
-                   "key takeaway", "the book says", "this article", "reading log"}
-DECIDE_PHRASES = {"i decided", "i've decided", "made a decision", "my decision is",
-                   "i'm choosing to", "going with", "i'm going to go with", "decision:"}
-BODY_PHRASES   = {"i slept", "slept for", "hours of sleep", "energy level", "energy is",
-                   "worked out", "hit the gym", "skipped the gym", "didn't work out", "no workout", "my workout"}
-RECALL_PHRASES  = {"what did i", "remind me", "what have i saved", "search my",
-                    "look up", "find my notes", "what do i know about", "have i written about"}
-WEEK_PHRASES    = {"weekly review", "how was my week", "week in review", "weekly summary", "review my week"}
-QUESTION_WORDS  = {"what ", "how much", "how many", "show me", "tell me", "did i ", "have i ",
-                    "how did", "how do", "when did", "where did", "which ", "who ", "why did"}
 
+def _execute_tool(name: str, inputs: dict) -> str:
+    entry_date = TODAY()
 
-def _natural_recall(text: str) -> str:
-    """Extract the search topic from a natural language recall request, then search."""
-    topic = _call_claude(
-        system="Extract the search topic from this query in 1-5 words. Output only the search terms, nothing else.",
-        user=text,
-        max_tokens=20,
-    ).strip()
-    return recall_agent(topic)
+    if name == "save_expense":
+        folder = "income" if inputs.get("category") == "income" else "expenses"
+        _append(VAULT / folder / f"{entry_date}.md", inputs["text"], entry_date)
+        return f"Saved to {folder}."
 
+    if name == "save_todo":
+        folder = "todos-school" if inputs.get("context") == "school" else "todos-work"
+        _append(VAULT / folder / f"{entry_date}.md", inputs["text"], entry_date)
+        return f"Saved to {folder}."
 
-def _is_question(lower: str) -> bool:
-    if lower.rstrip().endswith("?"):
-        return True
-    return any(lower.startswith(qw) or f" {qw}" in lower for qw in QUESTION_WORDS)
+    if name == "save_journal":
+        _append(VAULT / "journal" / f"{entry_date}.md", inputs["text"], entry_date)
+        return "Saved journal entry."
 
+    if name == "save_idea":
+        _append(VAULT / "ideas" / f"{entry_date}.md", inputs["text"], entry_date)
+        return "Saved idea."
 
-def orchestrate(text: str) -> str:
-    lower = text.lower()
-    if any(kw in lower for kw in FOCUS_PHRASES):
-        return focus_agent()
-    if any(kw in lower for kw in RECALL_PHRASES):
-        return _natural_recall(text)
-    if _is_question(lower):
-        return _natural_recall(text)
-    if any(kw in lower for kw in WEEK_PHRASES):
+    if name == "save_habit":
+        _append(VAULT / "habits" / f"{entry_date}.md", inputs["text"], entry_date)
+        return "Saved habit/schedule."
+
+    if name == "save_knowledge":
+        return learn_agent(inputs["text"])
+
+    if name == "save_decision":
+        _append(VAULT / "decisions" / f"{entry_date}.md", inputs["text"], entry_date)
+        return "Saved decision."
+
+    if name == "save_body":
+        _append(VAULT / "body" / f"{entry_date}.md", inputs["text"], entry_date)
+        return "Saved body data."
+
+    if name == "save_reading":
+        return read_agent(inputs["text"])
+
+    if name == "search_vault":
+        query = inputs["query"]
+        folders = inputs.get("folders") or [
+            "journal", "ideas", "todos-work", "todos-school",
+            "habits", "expenses", "income", "reading-log", "decisions", "body",
+        ]
+        results = []
+        for folder in folders:
+            folder_path = VAULT / folder
+            if not folder_path.exists():
+                continue
+            for f in sorted(folder_path.glob("*.md"), reverse=True)[:14]:
+                content = f.read_text(encoding="utf-8").strip()
+                if content:
+                    results.append(f"[{folder}/{f.name}]\n{content[:600]}")
+        for item in _load_json(VAULT / "knowledge" / "index.json", []):
+            results.append(f"[knowledge]\n{item['content']}")
+        return "\n\n---\n\n".join(results[:15]) if results else "No entries found."
+
+    if name == "get_focus_list":
+        today = TODAY()
+        parts = []
+        profile_path = VAULT / "profile.md"
+        if profile_path.exists():
+            parts.append(f"Profile:\n{profile_path.read_text(encoding='utf-8').strip()[:500]}")
+        work = _read_recent(VAULT / "todos-work", today)
+        if work:
+            parts.append(f"Work todos:\n{work}")
+        school = _read_recent(VAULT / "todos-school", today)
+        if school:
+            parts.append(f"School todos:\n{school}")
+        return "\n\n".join(parts) or "No todos found yet."
+
+    if name == "get_weekly_review":
         return week_agent()
-    if any(kw in lower for kw in LEARN_PHRASES):
-        return learn_agent(text)
-    if any(kw in lower for kw in READ_PHRASES):
-        return read_agent(text)
-    if any(kw in lower for kw in DECIDE_PHRASES):
-        return decide_agent(text)
-    if any(kw in lower for kw in BODY_PHRASES):
-        return body_agent(text)
-    if any(kw in lower for kw in FINANCE_KEYWORDS):
-        return finance_agent(text)
-    if any(kw in lower for kw in TASK_KEYWORDS):
-        return task_agent(text)
-    if any(kw in lower for kw in JOURNAL_KEYWORDS):
-        return journal_agent(text)
-    if any(kw in lower for kw in SCHED_KEYWORDS):
-        return scheduler_agent(text)
-    if any(kw in lower for kw in IDEA_KEYWORDS):
-        return ideas_agent(text)
-    return journal_agent(text)
+
+    return "Unknown tool."
+
+
+def ai_orchestrate(text: str) -> str:
+    profile = ""
+    profile_path = VAULT / "profile.md"
+    if profile_path.exists():
+        profile = profile_path.read_text(encoding="utf-8").strip()[:600]
+
+    system = f"""You are a smart personal assistant and second brain. Today is {TODAY()}.
+{f"About the user: {profile}" if profile else ""}
+
+You have tools to save information and search the user's vault. Use them when appropriate.
+
+Rules:
+- User shares info (expense, feeling, task, idea, etc.) → save it with the right tool, confirm naturally
+- User asks a question about their data → use search_vault with the right folders
+- User wants a schedule, focus list, or plan → use get_focus_list or reason it out conversationally
+- User is chatting or reflecting → respond naturally, save to journal if it's worth keeping
+- Never confirm with file paths. Say "logged that" or "saved your coffee expense" not "Saved to expenses/2026-03-21.md"
+- Be concise, warm, and direct. You're a smart assistant, not a filing system."""
+
+    messages = [{"role": "user", "content": text}]
+
+    response = claude.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1024,
+        system=system,
+        tools=TOOLS,
+        messages=messages,
+    )
+
+    while response.stop_reason == "tool_use":
+        tool_results = [
+            {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": _execute_tool(block.name, block.input),
+            }
+            for block in response.content
+            if block.type == "tool_use"
+        ]
+        messages = messages + [
+            {"role": "assistant", "content": response.content},
+            {"role": "user", "content": tool_results},
+        ]
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+            system=system,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+    return next((b.text for b in response.content if b.type == "text"), "Done.")
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +778,7 @@ def orchestrate(text: str) -> str:
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _save_chat_id(update.message.chat_id)
-    result = orchestrate(update.message.text)
+    result = ai_orchestrate(update.message.text)
     await update.message.reply_text(result)
 
 
@@ -580,8 +797,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-    result = orchestrate(text)
-    await update.message.reply_text(f'Transcribed: "{text}"\n\n{result}')
+    result = ai_orchestrate(text)
+    await update.message.reply_text(f'"{text}"\n\n{result}')
 
 
 async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
