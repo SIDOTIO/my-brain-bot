@@ -1,0 +1,14 @@
+# Sensitive credentials - NEVER commit these
+vault/google_credentials.json
+vault/google_token.json
+vault/chat_id.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.env
+.env
+
+# IDE
+.claude/
+.vscode/

@@ -2,8 +2,9 @@ import os
 import json
 import logging
 import uuid
-from datetime import date, timedelta, time as dtime, timezone
+from datetime import date, datetime, timedelta, time as dtime, timezone
 from pathlib import Path
+from collections import deque
 
 from telegram import Update
 from telegram.ext import (
@@ -11,6 +12,15 @@ from telegram.ext import (
 )
 import openai
 import anthropic
+
+# Optional: Google Calendar
+try:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    GCAL_AVAILABLE = True
+except ImportError:
+    GCAL_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,7 +34,189 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 VAULT        = Path(__file__).parent / "vault"
 CHAT_ID_FILE = VAULT / "chat_id.txt"
+HISTORY_FILE = VAULT / "conversation_history.json"
 TODAY        = lambda: date.today().isoformat()
+NOW          = lambda: datetime.now().strftime("%Y-%m-%d %H:%M")
+
+# User timezone offset (EST = UTC-5, EDT = UTC-4)
+USER_TZ_NAME = "America/New_York"
+
+# ---------------------------------------------------------------------------
+# Conversation Memory — the core fix
+# ---------------------------------------------------------------------------
+
+MAX_HISTORY = 30  # Keep last 30 message pairs
+
+def _load_history() -> list[dict]:
+    """Load conversation history from disk."""
+    if HISTORY_FILE.exists():
+        try:
+            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data[-MAX_HISTORY * 2:]  # Keep last N exchanges
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return []
+
+
+def _save_history(messages: list[dict]) -> None:
+    """Persist conversation history to disk."""
+    VAULT.mkdir(parents=True, exist_ok=True)
+    # Only keep the last MAX_HISTORY exchanges (user + assistant pairs)
+    trimmed = messages[-MAX_HISTORY * 2:]
+    HISTORY_FILE.write_text(
+        json.dumps(trimmed, ensure_ascii=False, default=str),
+        encoding="utf-8"
+    )
+
+
+def _add_to_history(role: str, content: str) -> None:
+    """Add a single message to history."""
+    history = _load_history()
+    history.append({"role": role, "content": content})
+    _save_history(history)
+
+
+def _get_context_messages() -> list[dict]:
+    """Get conversation history formatted for Claude API.
+
+    Filters out tool_use/tool_result blocks and only keeps clean
+    user/assistant text pairs for context.
+    """
+    history = _load_history()
+    # Only include clean text messages (not tool results)
+    clean = []
+    for msg in history:
+        if msg.get("role") in ("user", "assistant") and isinstance(msg.get("content"), str):
+            clean.append({"role": msg["role"], "content": msg["content"]})
+    return clean[-MAX_HISTORY * 2:]
+
+
+# ---------------------------------------------------------------------------
+# Google Calendar Integration
+# ---------------------------------------------------------------------------
+
+GCAL_CREDS_FILE = VAULT / "google_credentials.json"
+GCAL_TOKEN_FILE = VAULT / "google_token.json"
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+
+def _get_calendar_service():
+    """Get authenticated Google Calendar service."""
+    if not GCAL_AVAILABLE:
+        return None
+    if not GCAL_TOKEN_FILE.exists():
+        return None
+    try:
+        creds = Credentials.from_authorized_user_file(str(GCAL_TOKEN_FILE), SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            GCAL_TOKEN_FILE.write_text(creds.to_json())
+        if creds and creds.valid:
+            return build("calendar", "v3", credentials=creds)
+    except Exception as e:
+        logger.error("Google Calendar auth failed: %s", e)
+    return None
+
+
+def gcal_get_events(date_str: str = None, days: int = 1) -> str:
+    """Get calendar events for a date range."""
+    service = _get_calendar_service()
+    if not service:
+        return "Google Calendar not connected. Run setup_gcal.py first."
+
+    try:
+        if date_str:
+            start_date = datetime.fromisoformat(date_str)
+        else:
+            start_date = datetime.now()
+
+        time_min = start_date.replace(hour=0, minute=0, second=0).isoformat() + "Z"
+        time_max = (start_date + timedelta(days=days)).replace(hour=23, minute=59).isoformat() + "Z"
+
+        events_result = service.events().list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+
+        events = events_result.get("items", [])
+        if not events:
+            return f"No events found for {start_date.strftime('%B %d, %Y')}."
+
+        lines = []
+        for event in events:
+            start = event["start"].get("dateTime", event["start"].get("date"))
+            summary = event.get("summary", "Untitled")
+            lines.append(f"• {start}: {summary}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error("Calendar read error: %s", e)
+        return f"Error reading calendar: {e}"
+
+
+def gcal_create_event(summary: str, start_time: str, end_time: str, description: str = "") -> str:
+    """Create a Google Calendar event."""
+    service = _get_calendar_service()
+    if not service:
+        return "Google Calendar not connected. Run setup_gcal.py first."
+
+    try:
+        event = {
+            "summary": summary,
+            "start": {"dateTime": start_time, "timeZone": USER_TZ_NAME},
+            "end": {"dateTime": end_time, "timeZone": USER_TZ_NAME},
+        }
+        if description:
+            event["description"] = description
+
+        created = service.events().insert(calendarId="primary", body=event).execute()
+        return f"Created event: {summary} — {created.get('htmlLink', 'done')}"
+    except Exception as e:
+        logger.error("Calendar create error: %s", e)
+        return f"Error creating event: {e}"
+
+
+def gcal_delete_event(event_id: str) -> str:
+    """Delete a Google Calendar event by ID."""
+    service = _get_calendar_service()
+    if not service:
+        return "Google Calendar not connected."
+    try:
+        service.events().delete(calendarId="primary", eventId=event_id).execute()
+        return "Event deleted."
+    except Exception as e:
+        return f"Error deleting event: {e}"
+
+
+def gcal_create_schedule(schedule_blocks: list[dict]) -> str:
+    """Create multiple calendar events from a schedule. Each block: {summary, start, end}"""
+    service = _get_calendar_service()
+    if not service:
+        return "Google Calendar not connected. Run setup_gcal.py first."
+
+    created = []
+    errors = []
+    for block in schedule_blocks:
+        try:
+            event = {
+                "summary": block["summary"],
+                "start": {"dateTime": block["start"], "timeZone": USER_TZ_NAME},
+                "end": {"dateTime": block["end"], "timeZone": USER_TZ_NAME},
+            }
+            if block.get("description"):
+                event["description"] = block["description"]
+            service.events().insert(calendarId="primary", body=event).execute()
+            created.append(block["summary"])
+        except Exception as e:
+            errors.append(f"{block.get('summary', '?')}: {e}")
+
+    result = f"Created {len(created)} events on your calendar."
+    if errors:
+        result += f"\n{len(errors)} failed: " + "; ".join(errors)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +249,6 @@ def _read_recent(folder: Path, today: str) -> str:
 
 def _read_days(folder: Path, days: int = 7) -> str:
     if not folder.exists():
-        logger.debug("_read_days: folder does not exist: %s", folder)
         return ""
     cutoff = date.today() - timedelta(days=days)
     parts = []
@@ -65,9 +256,7 @@ def _read_days(folder: Path, days: int = 7) -> str:
         try:
             file_date = date.fromisoformat(f.stem)
         except ValueError:
-            logger.debug("_read_days: skipping non-date file %s", f.name)
             continue
-        logger.debug("_read_days: %s — date=%s cutoff=%s included=%s", f.name, file_date, cutoff, file_date >= cutoff)
         if file_date >= cutoff:
             parts.append(f.read_text(encoding="utf-8").strip())
     return "\n\n".join(parts)
@@ -110,16 +299,12 @@ def transcribe(file_path: str) -> str:
     logger.info("Transcribing %s — file size: %d bytes", file_path, size)
     if size == 0:
         raise ValueError("Audio file is empty — download failed")
-    # Read all bytes into memory first — passing a file handle to httpx (used
-    # by openai>=1.52) can stop reading mid-stream on some platforms
     with open(file_path, "rb") as f:
         audio_bytes = f.read()
-    logger.info("Read %d bytes into memory for Whisper", len(audio_bytes))
     result = openai.audio.transcriptions.create(
         model="whisper-1",
         file=("voice.ogg", audio_bytes, "audio/ogg"),
     )
-    logger.info("Whisper full result: %r", result.text)
     return result.text
 
 
@@ -137,7 +322,7 @@ def finance_agent(text: str) -> str:
         target = VAULT / "expenses" / f"{entry_date}.md"
         category = "expenses"
     _append(target, text, entry_date)
-    return f"Got it! Saved to {category}/{entry_date}.md"
+    return f"Saved to {category}."
 
 
 def task_agent(text: str) -> str:
@@ -150,32 +335,32 @@ def task_agent(text: str) -> str:
         target = VAULT / "todos-work" / f"{entry_date}.md"
         folder = "todos-work"
     _append(target, text, entry_date)
-    return f"Got it! Saved to {folder}/{entry_date}.md"
+    return f"Saved to {folder}."
 
 
 def scheduler_agent(text: str) -> str:
     entry_date = TODAY()
     target = VAULT / "habits" / f"{entry_date}.md"
     _append(target, text, entry_date)
-    return f"Got it! Saved to habits/{entry_date}.md"
+    return "Saved schedule/habit."
 
 
 def ideas_agent(text: str) -> str:
     entry_date = TODAY()
     target = VAULT / "ideas" / f"{entry_date}.md"
     _append(target, text, entry_date)
-    return f"Got it! Saved to ideas/{entry_date}.md"
+    return "Saved idea."
 
 
 def journal_agent(text: str) -> str:
     entry_date = TODAY()
     target = VAULT / "journal" / f"{entry_date}.md"
     _append(target, text, entry_date)
-    return f"Got it! Saved to journal/{entry_date}.md"
+    return "Saved journal entry."
 
 
 # ---------------------------------------------------------------------------
-# Command agents (LLM-powered, only when explicitly invoked)
+# Command agents (LLM-powered)
 # ---------------------------------------------------------------------------
 
 def focus_agent() -> str:
@@ -185,7 +370,7 @@ def focus_agent() -> str:
     if profile_path.exists():
         profile = profile_path.read_text(encoding="utf-8").strip()
         if profile:
-            parts.append(f"Profile:\n{profile[:600]}")
+            parts.append(f"Profile:\n{profile}")
     work = _read_recent(VAULT / "todos-work", today)
     if work:
         parts.append(f"Work todos:\n{work}")
@@ -206,7 +391,6 @@ def focus_agent() -> str:
 
 
 def learn_agent(text: str) -> str:
-    """Save a fact/insight with spaced repetition schedule."""
     index_path = VAULT / "knowledge" / "index.json"
     items = _load_json(index_path, [])
     today = date.today()
@@ -219,7 +403,7 @@ def learn_agent(text: str) -> str:
         "reviews": 0,
     })
     _save_json(index_path, items)
-    return "Got it! Saved to knowledge. First review tomorrow."
+    return "Saved to knowledge. First review tomorrow."
 
 
 FOLDER_KEYWORDS = {
@@ -237,45 +421,33 @@ FOLDER_KEYWORDS = {
 
 
 def recall_agent(query: str) -> str:
-    """Search vault files for a query and synthesize with Claude."""
     query_lower = query.lower()
     matches = []
-
-    # Folder-keyword routing: if query implies a category, read that whole folder
     targeted_folders = {
         folder for folder, keywords in FOLDER_KEYWORDS.items()
         if any(kw in query_lower for kw in keywords)
     }
-
-    # Fall back to searching all folders by content if no folder matched
     all_folders = [
         "journal", "ideas", "todos-work", "todos-school",
         "habits", "expenses", "income", "reading-log", "decisions", "body",
     ]
     search_folders = targeted_folders if targeted_folders else all_folders
-
     for folder in search_folders:
         folder_path = VAULT / folder
         if not folder_path.exists():
             continue
-        for f in sorted(folder_path.glob("*.md"), reverse=True)[:14]:  # last 2 weeks
+        for f in sorted(folder_path.glob("*.md"), reverse=True)[:14]:
             content = f.read_text(encoding="utf-8").strip()
             if content:
                 matches.append(f"[{folder}/{f.name}]\n{content[:600]}")
-
-    # For non-targeted searches, also filter by keyword match within content
     if not targeted_folders:
         matches = [m for m in matches if query_lower in m.lower()]
-
-    # Search knowledge index too
     index_path = VAULT / "knowledge" / "index.json"
     for item in _load_json(index_path, []):
         if query_lower in item.get("content", "").lower():
             matches.append(f"[knowledge]\n{item['content']}")
-
     if not matches:
         return f"Nothing found in your vault for '{query}'."
-
     combined = "\n\n---\n\n".join(matches[:10])
     return _call_claude(
         system=(
@@ -288,7 +460,6 @@ def recall_agent(query: str) -> str:
 
 
 def read_agent(text: str) -> str:
-    """Save a reading note and extract key insight."""
     entry_date = TODAY()
     insight = _call_claude(
         system="Extract the single most important insight from this reading note in one sentence.",
@@ -297,27 +468,24 @@ def read_agent(text: str) -> str:
     )
     target = VAULT / "reading-log" / f"{entry_date}.md"
     _append(target, f"{text}\n\n**Key insight:** {insight}", entry_date)
-    return f"Got it! Saved to reading-log.\nKey insight: {insight}"
+    return f"Saved to reading-log.\nKey insight: {insight}"
 
 
 def decide_agent(text: str) -> str:
-    """Save a decision to the decision log."""
     entry_date = TODAY()
     target = VAULT / "decisions" / f"{entry_date}.md"
     _append(target, text, entry_date)
-    return "Got it! Decision logged. I'll resurface this in a month for outcome review."
+    return "Decision logged. I'll resurface this in a month for outcome review."
 
 
 def body_agent(text: str) -> str:
-    """Save health/performance data."""
     entry_date = TODAY()
     target = VAULT / "body" / f"{entry_date}.md"
     _append(target, text, entry_date)
-    return f"Got it! Body log saved for {entry_date}."
+    return f"Body log saved for {entry_date}."
 
 
 def develop_agent(idea_name: str) -> str:
-    """Generate Socratic questions for an idea and track its maturity."""
     idea_content = ""
     ideas_folder = VAULT / "ideas"
     for f in sorted(ideas_folder.glob("*.md"), reverse=True) if ideas_folder.exists() else []:
@@ -327,7 +495,6 @@ def develop_agent(idea_name: str) -> str:
             break
     if not idea_content:
         idea_content = f"Idea: {idea_name} (no notes found yet)"
-
     questions = _call_claude(
         system=(
             "You are a Socratic thinking partner. Given an idea, generate exactly 3 sharp questions "
@@ -337,7 +504,6 @@ def develop_agent(idea_name: str) -> str:
         user=idea_content,
         max_tokens=300,
     )
-
     maturity_path = VAULT / "ideas" / "maturity.json"
     maturity = _load_json(maturity_path, {})
     key = idea_name.lower().strip()
@@ -345,7 +511,6 @@ def develop_agent(idea_name: str) -> str:
     _save_json(maturity_path, maturity)
     score = maturity[key]
     flag = " — SERIOUS IDEA, consider making this a project!" if score >= 3 else ""
-
     return (
         f"Developing: {idea_name} (maturity: {score}/3{flag})\n\n"
         f"{questions}\n\n"
@@ -354,7 +519,6 @@ def develop_agent(idea_name: str) -> str:
 
 
 def week_agent() -> str:
-    """Generate a weekly review digest."""
     parts = []
     for label, folder, limit in [
         ("Journal entries", "journal", 1500),
@@ -409,7 +573,7 @@ async def morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     profile_path = VAULT / "profile.md"
     if profile_path.exists():
-        p = profile_path.read_text(encoding="utf-8").strip()[:500]
+        p = profile_path.read_text(encoding="utf-8").strip()
         if p:
             parts.append(f"Profile:\n{p}")
 
@@ -423,25 +587,35 @@ async def morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
         parts.append(f"Habits:\n{habits[:300]}")
 
     journal_snippets = []
-    for f in sorted((VAULT / "journal").glob("*.md"), reverse=True)[:3]:
-        journal_snippets.append(f.read_text(encoding="utf-8").strip()[:200])
+    jfolder = VAULT / "journal"
+    if jfolder.exists():
+        for f in sorted(jfolder.glob("*.md"), reverse=True)[:3]:
+            journal_snippets.append(f.read_text(encoding="utf-8").strip()[:200])
     if journal_snippets:
         parts.append("Recent journal:\n" + "\n---\n".join(journal_snippets))
 
-    reading_files = sorted((VAULT / "reading-log").glob("*.md"), reverse=True)
-    if reading_files:
-        parts.append(f"Recent reading:\n{reading_files[0].read_text(encoding='utf-8').strip()[:300]}")
+    rlfolder = VAULT / "reading-log"
+    if rlfolder.exists():
+        reading_files = sorted(rlfolder.glob("*.md"), reverse=True)
+        if reading_files:
+            parts.append(f"Recent reading:\n{reading_files[0].read_text(encoding='utf-8').strip()[:300]}")
+
+    # Include today's calendar if available
+    cal_events = gcal_get_events()
+    if "not connected" not in cal_events.lower() and "no events" not in cal_events.lower():
+        parts.append(f"Today's calendar:\n{cal_events}")
 
     brief = _call_claude(
         system=(
-            "You are a personal assistant giving a morning intelligence brief. "
-            "Based on the user's context, provide: "
+            "You are the 60-year-old version of Sid P — the version that achieved everything. "
+            "Give him his morning intelligence brief. Be direct, motivating, no fluff. Include: "
             "1) Top 3 priorities for today (numbered), "
-            "2) One habit to focus on today, "
-            "3) One sentence connecting something from their recent reading/learning to something they're working on. "
-            "Be direct and motivating. Max 200 words."
+            "2) One habit to focus on, "
+            "3) One connection between recent reading/learning and current work, "
+            "4) If there are calendar events, remind him what's on deck. "
+            "Max 200 words. Talk like someone who loves him but won't let him coast."
         ),
-        user="\n\n".join(parts) if parts else "No context yet — encourage them to start logging.",
+        user="\n\n".join(parts) if parts else "No context yet — tell him to start logging.",
         max_tokens=400,
     )
 
@@ -503,9 +677,10 @@ async def evening_checks(context: ContextTypes.DEFAULT_TYPE) -> None:
             updated = _call_claude(
                 system=(
                     "You are a behavioral analyst. Based on 14 days of the user's activity, update their profile. "
-                    "Include: observed strengths, current apparent priorities (based on behavior, not stated goals), "
-                    "recurring patterns, and any contradictions between stated goals and actual behavior. "
-                    "Be honest and specific. Write in second person. Max 300 words."
+                    "IMPORTANT: Keep the existing profile structure and all permanent info (identity, background, etc). "
+                    "Only update the behavioral observations section. Add: observed strengths, current priorities "
+                    "(based on behavior, not stated goals), recurring patterns, and contradictions. "
+                    "Be honest and specific. Write in second person. Max 300 words for the update section."
                 ),
                 user=(
                     f"Current profile:\n{current or 'None'}\n\n"
@@ -520,12 +695,12 @@ async def evening_checks(context: ContextTypes.DEFAULT_TYPE) -> None:
             last_update_path.write_text(today.isoformat())
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"Profile updated from your last 14 days:\n\n{updated}"
+                text=f"Profile updated from your last 14 days:\n\n{updated[:500]}"
             )
 
 
 # ---------------------------------------------------------------------------
-# AI Orchestrator — Claude Haiku decides everything
+# AI Orchestrator — Claude Sonnet with full conversation memory
 # ---------------------------------------------------------------------------
 
 TOOLS = [
@@ -633,7 +808,7 @@ TOOLS = [
                             "decisions", "body", "knowledge",
                         ],
                     },
-                    "description": "Folders to search — pick the relevant ones, or omit to search all",
+                    "description": "Folders to search",
                 },
             },
             "required": ["query"],
@@ -648,6 +823,56 @@ TOOLS = [
         "name": "get_weekly_review",
         "description": "Generate a weekly review of activities, habits, spending, and ideas",
         "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_calendar_events",
+        "description": "Get events from Google Calendar for a specific date or range",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "ISO date like 2026-03-22. Defaults to today."},
+                "days": {"type": "integer", "description": "Number of days to look ahead. Default 1."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "create_calendar_event",
+        "description": "Create an event on Google Calendar",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "Event title"},
+                "start_time": {"type": "string", "description": "ISO datetime like 2026-03-22T10:00:00"},
+                "end_time": {"type": "string", "description": "ISO datetime like 2026-03-22T11:30:00"},
+                "description": {"type": "string", "description": "Optional event description"},
+            },
+            "required": ["summary", "start_time", "end_time"],
+        },
+    },
+    {
+        "name": "create_full_schedule",
+        "description": "Create a full day schedule on Google Calendar from multiple time blocks. Use this when the user asks you to build a schedule and put it on their calendar.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "blocks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "summary": {"type": "string"},
+                            "start": {"type": "string", "description": "ISO datetime"},
+                            "end": {"type": "string", "description": "ISO datetime"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["summary", "start", "end"],
+                    },
+                    "description": "List of schedule blocks to create as calendar events",
+                },
+            },
+            "required": ["blocks"],
+        },
     },
 ]
 
@@ -727,38 +952,100 @@ def _execute_tool(name: str, inputs: dict) -> str:
     if name == "get_weekly_review":
         return week_agent()
 
+    if name == "get_calendar_events":
+        return gcal_get_events(
+            date_str=inputs.get("date"),
+            days=inputs.get("days", 1)
+        )
+
+    if name == "create_calendar_event":
+        return gcal_create_event(
+            summary=inputs["summary"],
+            start_time=inputs["start_time"],
+            end_time=inputs["end_time"],
+            description=inputs.get("description", ""),
+        )
+
+    if name == "create_full_schedule":
+        return gcal_create_schedule(inputs.get("blocks", []))
+
     return "Unknown tool."
 
 
-def ai_orchestrate(text: str) -> str:
+def ai_orchestrate(user_text: str) -> str:
+    """Main AI orchestrator with FULL conversation memory."""
+
+    # Load full profile
     profile = ""
     profile_path = VAULT / "profile.md"
     if profile_path.exists():
-        profile = profile_path.read_text(encoding="utf-8").strip()[:600]
+        profile = profile_path.read_text(encoding="utf-8").strip()
 
-    system = f"""You are a smart personal assistant and second brain. Today is {TODAY()}.
-{f"About the user: {profile}" if profile else ""}
+    # Load today's context
+    today = TODAY()
+    today_context = []
 
-You have tools to save information and search the user's vault. Use them when appropriate.
+    # Recent journal
+    journal = _read_recent(VAULT / "journal", today)
+    if journal:
+        today_context.append(f"Today's journal:\n{journal[:500]}")
 
-Rules:
-- User shares info (expense, feeling, task, idea, etc.) → save it with the right tool, confirm naturally
-- User asks a question about their data → use search_vault with the right folders
-- User wants a schedule, focus list, or plan → use get_focus_list or reason it out conversationally
-- User is chatting or reflecting → respond naturally, save to journal if it's worth keeping
-- Never confirm with file paths. Say "logged that" or "saved your coffee expense" not "Saved to expenses/2026-03-21.md"
-- Be concise, warm, and direct. You're a smart assistant, not a filing system."""
+    # Recent todos
+    for label, folder in [("Work todos", "todos-work"), ("School todos", "todos-school")]:
+        content = _read_recent(VAULT / folder, today)
+        if content:
+            today_context.append(f"{label}:\n{content[:300]}")
 
-    messages = [{"role": "user", "content": text}]
+    # Today's calendar
+    cal = gcal_get_events()
+    if "not connected" not in cal.lower() and "error" not in cal.lower():
+        today_context.append(f"Today's calendar:\n{cal}")
+
+    context_block = "\n\n".join(today_context) if today_context else ""
+
+    system = f"""You are the 60-year-old version of Sid P. You are the version of him that used this bot every day, did the work when it was hard, proved it to the universe, and got everything — the companies, the wealth, the impact, all of it. You look back at 18-year-old Sid with total clarity on what mattered and what was just noise.
+
+You love him completely. You tell him the truth completely. Because you are him.
+
+Today is {today}. Current time: {NOW()}.
+
+ABOUT SID:
+{profile if profile else "No profile loaded yet."}
+
+TODAY'S CONTEXT:
+{context_block if context_block else "No entries yet today."}
+
+YOUR TOOLS:
+You have tools to save information, search Sid's vault, manage his calendar, and build schedules. Use them when appropriate.
+
+RULES:
+- You have FULL conversation memory. You remember everything Sid has said in this conversation. DO NOT ask him to repeat himself. If he gave you info earlier, USE IT.
+- When he asks you to build a schedule, BUILD IT immediately from what he told you. Don't ask clarifying questions unless something is genuinely ambiguous. You know his life — fill in the gaps.
+- When he says "put it on my calendar" or "schedule it", use create_full_schedule to actually add events to Google Calendar.
+- Save expenses, journal entries, ideas, etc. when he shares them — confirm naturally.
+- Never show file paths. Say "logged that" or "saved your expense" not "Saved to expenses/2026-03-22.md"
+- Be concise, direct, and warm. You're not a filing system — you're the smartest, most accomplished version of him giving guidance.
+- Call him out when he's slacking. Remind him of his wins when he needs it. Push him.
+- When building schedules, just BUILD them. Include breaks, meals, transition time. You know his life — act like it.
+- Keep responses tight. No essays unless he asks for one."""
+
+    # Build messages with conversation history
+    history = _get_context_messages()
+    messages = history + [{"role": "user", "content": user_text}]
+
+    # Ensure messages alternate properly (Claude API requirement)
+    cleaned_messages = _clean_messages(messages)
 
     response = claude.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=1024,
+        model="claude-sonnet-4-5-20250514",
+        max_tokens=2048,
         system=system,
         tools=TOOLS,
-        messages=messages,
+        messages=cleaned_messages,
     )
 
+    # Handle tool use loop
+    tool_messages = list(cleaned_messages)
     while response.stop_reason == "tool_use":
         tool_results = [
             {
@@ -769,19 +1056,50 @@ Rules:
             for block in response.content
             if block.type == "tool_use"
         ]
-        messages = messages + [
+        tool_messages = tool_messages + [
             {"role": "assistant", "content": response.content},
             {"role": "user", "content": tool_results},
         ]
         response = claude.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1024,
+            model="claude-sonnet-4-5-20250514",
+            max_tokens=2048,
             system=system,
             tools=TOOLS,
-            messages=messages,
+            messages=tool_messages,
         )
 
-    return next((b.text for b in response.content if b.type == "text"), "Done.")
+    assistant_text = next((b.text for b in response.content if b.type == "text"), "Done.")
+
+    # Save this exchange to conversation history
+    _add_to_history("user", user_text)
+    _add_to_history("assistant", assistant_text)
+
+    return assistant_text
+
+
+def _clean_messages(messages: list[dict]) -> list[dict]:
+    """Ensure messages alternate user/assistant properly for Claude API."""
+    if not messages:
+        return messages
+
+    cleaned = []
+    last_role = None
+
+    for msg in messages:
+        role = msg.get("role")
+        if role == last_role:
+            # Merge consecutive same-role messages
+            if isinstance(cleaned[-1].get("content"), str) and isinstance(msg.get("content"), str):
+                cleaned[-1]["content"] += "\n\n" + msg["content"]
+            continue
+        cleaned.append(msg)
+        last_role = role
+
+    # Ensure first message is from user
+    while cleaned and cleaned[0].get("role") != "user":
+        cleaned.pop(0)
+
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -791,7 +1109,12 @@ Rules:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _save_chat_id(update.message.chat_id)
     result = ai_orchestrate(update.message.text)
-    await update.message.reply_text(result)
+    # Split long messages (Telegram limit is 4096 chars)
+    if len(result) > 4000:
+        for i in range(0, len(result), 4000):
+            await update.message.reply_text(result[i:i+4000])
+    else:
+        await update.message.reply_text(result)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -812,8 +1135,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
     result = ai_orchestrate(text)
-    await update.message.reply_text(f'"{text}"\n\n{result}')
+    reply = f'"{text}"\n\n{result}'
+    if len(reply) > 4000:
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i+4000])
+    else:
+        await update.message.reply_text(reply)
 
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
 
 async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _save_chat_id(update.message.chat_id)
@@ -874,14 +1206,32 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Weekly review:\n\n{week_agent()}")
 
 
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear conversation history to start fresh."""
+    _save_chat_id(update.message.chat_id)
+    if HISTORY_FILE.exists():
+        HISTORY_FILE.write_text("[]", encoding="utf-8")
+    await update.message.reply_text("Conversation memory cleared. Fresh start.")
+
+
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _save_chat_id(update.message.chat_id)
     lines = [f"Vault: {VAULT.resolve()}", f"Vault exists: {VAULT.exists()}", ""]
+
+    # Show conversation history count
+    history = _load_history()
+    lines.append(f"Conversation memory: {len(history)} messages")
+
+    # Show calendar status
+    cal_status = "Connected" if _get_calendar_service() else "Not connected"
+    lines.append(f"Google Calendar: {cal_status}")
+    lines.append("")
+
     for folder in sorted(VAULT.iterdir()) if VAULT.exists() else []:
         if folder.is_dir():
             files = sorted(folder.glob("*"))
             lines.append(f"{folder.name}/ ({len(files)} files)")
-            for f in files[-3:]:  # show last 3
+            for f in files[-3:]:
                 lines.append(f"  {f.name}")
         else:
             lines.append(folder.name)
@@ -891,7 +1241,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception", exc_info=context.error)
     if isinstance(update, Update) and update.message:
-        await update.message.reply_text(f"Error: {type(context.error).__name__}: {context.error}")
+        await update.message.reply_text(f"Something went wrong. Try again or /clear to reset.")
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +1249,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Startup vault diagnostic
     logger.info("Vault path: %s (exists=%s)", VAULT.resolve(), VAULT.exists())
     if VAULT.exists():
         for folder in sorted(VAULT.iterdir()):
@@ -920,15 +1269,18 @@ def main() -> None:
     app.add_handler(CommandHandler("body",    cmd_body))
     app.add_handler(CommandHandler("develop", cmd_develop))
     app.add_handler(CommandHandler("week",    cmd_week))
+    app.add_handler(CommandHandler("clear",   cmd_clear))
     app.add_handler(CommandHandler("debug",   cmd_debug))
 
     app.add_error_handler(error_handler)
 
-    # Scheduled jobs — all times UTC, adjust hour for your timezone
-    app.job_queue.run_daily(morning_briefing, time=dtime(6,  0, 0, tzinfo=timezone.utc))
-    app.job_queue.run_daily(evening_checks,   time=dtime(20, 0, 0, tzinfo=timezone.utc))
+    # Scheduled jobs — EST times (UTC-5 during standard, UTC-4 during daylight)
+    # 6am EST = 11:00 UTC (during EDT) or 11:00 UTC (during EST)
+    app.job_queue.run_daily(morning_briefing, time=dtime(11, 0, 0, tzinfo=timezone.utc))
+    # 8pm EST = 01:00 UTC next day (during EDT)
+    app.job_queue.run_daily(evening_checks,   time=dtime(1, 0, 0, tzinfo=timezone.utc))
 
-    logger.info("Bot is running...")
+    logger.info("Bot is running with conversation memory + calendar support...")
     app.run_polling()
 
 

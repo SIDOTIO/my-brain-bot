@@ -1,3 +1,6 @@
 python-telegram-bot[job-queue]==21.6
 openai>=1.52.0
 anthropic
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
