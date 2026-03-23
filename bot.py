@@ -1245,9 +1245,11 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled exception", exc_info=context.error)
+    error_type = type(context.error).__name__
+    error_msg = str(context.error)
+    logger.error(f"Unhandled {error_type}: {error_msg}", exc_info=context.error)
     if isinstance(update, Update) and update.message:
-        await update.message.reply_text(f"Something went wrong. Try again or /clear to reset.")
+        await update.message.reply_text(f"Error: {error_type}: {error_msg[:100]}")
 
 
 # ---------------------------------------------------------------------------
