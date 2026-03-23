@@ -129,10 +129,10 @@ def gcal_get_events(date_str: str = None, days: int = 1) -> str:
         if date_str:
             start_date = datetime.fromisoformat(date_str)
         else:
-            start_date = datetime.now()
+            start_date = datetime.now(timezone.utc)
 
-        time_min = start_date.replace(hour=0, minute=0, second=0).isoformat() + "Z"
-        time_max = (start_date + timedelta(days=days)).replace(hour=23, minute=59).isoformat() + "Z"
+        time_min = start_date.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        time_max = (start_date + timedelta(days=days)).replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
 
         events_result = service.events().list(
             calendarId="primary",
