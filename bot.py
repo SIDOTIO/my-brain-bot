@@ -104,9 +104,29 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
 def _get_calendar_service():
-    """Get authenticated Google Calendar service."""
+    """Get authenticated Google Calendar service.
+
+    Reads token from GOOGLE_TOKEN_JSON env var (for Railway)
+    or from vault/google_token.json (for local dev).
+    """
     if not GCAL_AVAILABLE:
         return None
+
+    # Try env var first (Railway deployment)
+    token_json = os.environ.get("GOOGLE_TOKEN_JSON")
+    if token_json:
+        try:
+            token_data = json.loads(token_json)
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                # Update env var not possible, but token refreshes in memory
+            if creds and creds.valid:
+                return build("calendar", "v3", credentials=creds)
+        except Exception as e:
+            logger.error("Google Calendar auth from env failed: %s", e)
+
+    # Fall back to file (local dev)
     if not GCAL_TOKEN_FILE.exists():
         return None
     try:
@@ -117,7 +137,7 @@ def _get_calendar_service():
         if creds and creds.valid:
             return build("calendar", "v3", credentials=creds)
     except Exception as e:
-        logger.error("Google Calendar auth failed: %s", e)
+        logger.error("Google Calendar auth from file failed: %s", e)
     return None
 
 
