@@ -49,12 +49,14 @@ MAX_HISTORY = 30  # Keep last 30 message pairs
 
 def _load_history() -> list[dict]:
     """Load conversation history from disk."""
+    VAULT.mkdir(parents=True, exist_ok=True)  # Ensure vault exists
     if HISTORY_FILE.exists():
         try:
             data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 return data[-MAX_HISTORY * 2:]  # Keep last N exchanges
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            logger.warning("Could not load history: %s", e)
             pass
     return []
 
@@ -996,10 +998,14 @@ def ai_orchestrate(user_text: str) -> str:
         if content:
             today_context.append(f"{label}:\n{content[:300]}")
 
-    # Today's calendar
-    cal = gcal_get_events()
-    if "not connected" not in cal.lower() and "error" not in cal.lower():
-        today_context.append(f"Today's calendar:\n{cal}")
+    # Today's calendar (wrapped in try-except to not crash if calendar fails)
+    try:
+        cal = gcal_get_events()
+        if cal and "not connected" not in cal.lower() and "error" not in cal.lower():
+            today_context.append(f"Today's calendar:\n{cal}")
+    except Exception as e:
+        logger.warning("Calendar error (non-fatal): %s", e)
+        # Continue without calendar, don't crash
 
     context_block = "\n\n".join(today_context) if today_context else ""
 
